@@ -18,6 +18,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -69,6 +70,10 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.LocalDate
@@ -176,6 +181,26 @@ fun Reveal(delayMs: Int, content: @Composable () -> Unit) {
 @Composable
 fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
     val haptic = LocalHapticFeedback.current
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val ver = remember { currentVersion(ctx) }
+    var upd by remember { mutableStateOf<Upd>(Upd.Idle) }
+    val runCheck: () -> Unit = { scope.launch { upd = Upd.Checking; upd = checkUpdate(ctx) } }
+    LaunchedEffect(Unit) { runCheck() }
+    val onUpdate: () -> Unit = {
+        when (val u = upd) {
+            is Upd.Available -> scope.launch {
+                upd = Upd.Downloading(0)
+                try {
+                    val f = downloadApk(ctx, u.url) { upd = Upd.Downloading(it) }
+                    upd = Upd.Ready(f); installApk(ctx, f)
+                } catch (e: Exception) { upd = Upd.Failed }
+            }
+            is Upd.Ready -> installApk(ctx, u.file)
+            is Upd.Downloading, Upd.Checking -> {}
+            else -> runCheck()
+        }
+    }
     var screen by remember { mutableIntStateOf(0) }
     val root = remember { Environment.getExternalStorageDirectory() }
     var dir by remember { mutableStateOf(root) }
@@ -184,7 +209,7 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
     }
     BackHandler(screen == 1) { if (dir != root) dir = dir.parentFile ?: root else screen = 0 }
 
-    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF7474FB), Color(0xFF5B5BE6))))) {
+    Box(Modifier.fillMaxSize().background(Ink)) {
         AnimatedContent(
             targetState = screen,
             transitionSpec = {
@@ -195,7 +220,7 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
                     togetherWith (slideOutVertically(tween(650)) { it } + fadeOut(tween(400))))
             }, label = "nav"
         ) { s ->
-            if (s == 0) Home(stats, granted, haptic) { if (granted) screen = 1 else onAsk() }
+            if (s == 0) Home(stats, granted, haptic, upd, ver, onUpdate) { if (granted) screen = 1 else onAsk() }
             else Explorer(stats, root, dir, haptic, { dir = it }, { dir = dir.parentFile?.takeIf { p -> dir != root } ?: root }, { screen = 0 })
         }
     }
@@ -203,14 +228,17 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
 
 // ---------- Screen 1: Home ----------
 @Composable
-fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, onOpen: () -> Unit) {
+fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, upd: Upd, ver: String, onUpdate: () -> Unit, onOpen: () -> Unit) {
     val files by animateIntAsState(stats.files, tween(1400), label = "f")
     val folders by animateIntAsState(stats.folders, tween(1400), label = "d")
     val bob by rememberInfiniteTransition(label = "chev").animateFloat(0f, -6f,
         infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "bob")
 
-    Column(Modifier.fillMaxSize().padding(14.dp).clip(RoundedCornerShape(40.dp)).background(Ink)) {
-        Box(Modifier.fillMaxWidth().weight(0.40f).padding(12.dp)) { CosmicHero() }
+    Column(Modifier.fillMaxSize().background(Ink).windowInsetsPadding(WindowInsets.safeDrawing)) {
+        Box(Modifier.fillMaxWidth().weight(0.40f).padding(12.dp)) {
+            CosmicHero()
+            UpdatePill(upd, ver, haptic, onUpdate, Modifier.align(Alignment.TopStart).padding(start = 10.dp, top = 6.dp))
+        }
         Column(Modifier.padding(horizontal = 22.dp)) {
             Reveal(200) {
                 Column {
@@ -344,7 +372,7 @@ fun Explorer(
     val heart by animateFloatAsState(if (liked) 1.25f else 1f, spring(Spring.DampingRatioHighBouncy), label = "heart")
     val date = remember { LocalDate.now().format(DateTimeFormatter.ofPattern("MMMM d, yyyy")) }
 
-    Column(Modifier.fillMaxSize().padding(14.dp).clip(RoundedCornerShape(40.dp)).background(Ink)) {
+    Column(Modifier.fillMaxSize().background(Ink).windowInsetsPadding(WindowInsets.safeDrawing)) {
         Box(Modifier.fillMaxWidth().weight(0.36f).padding(16.dp)) {
             Column(Modifier.align(Alignment.Center), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 CATS.chunked(3).forEachIndexed { r, row ->
@@ -449,5 +477,104 @@ fun Blob(name: String, count: Int, seed: Int) {
             drawCircle(Color(0xFFD9822B), 3.dp.toPx(), Offset(w * .18f, h * .4f))
         }
         Text("$name $count", color = Grey, fontSize = 10.sp)
+    }
+}
+
+
+// ---------- In-app updater (GitHub Releases) ----------
+const val REPO = "faliqfaizullah-cloud/cosmos-files"
+
+sealed interface Upd {
+    data object Idle : Upd
+    data object Checking : Upd
+    data object Latest : Upd
+    data object Failed : Upd
+    data class Available(val ver: String, val url: String) : Upd
+    data class Downloading(val pct: Int) : Upd
+    data class Ready(val file: File) : Upd
+}
+
+fun currentVersion(ctx: Context): String =
+    runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: "1.0"
+
+fun isNewer(a: String, b: String): Boolean {
+    val x = a.split(".").map { it.toIntOrNull() ?: 0 }
+    val y = b.split(".").map { it.toIntOrNull() ?: 0 }
+    for (i in 0 until maxOf(x.size, y.size)) {
+        val p = x.getOrElse(i) { 0 }; val q = y.getOrElse(i) { 0 }
+        if (p != q) return p > q
+    }
+    return false
+}
+
+suspend fun checkUpdate(ctx: Context): Upd = withContext(Dispatchers.IO) {
+    try {
+        val c = URL("https://api.github.com/repos/$REPO/releases/latest").openConnection() as HttpURLConnection
+        c.setRequestProperty("Accept", "application/vnd.github+json")
+        c.connectTimeout = 10000; c.readTimeout = 10000
+        val j = JSONObject(c.inputStream.bufferedReader().readText())
+        val tag = j.getString("tag_name").removePrefix("v")
+        val assets = j.getJSONArray("assets")
+        var url: String? = null
+        for (i in 0 until assets.length()) {
+            val a = assets.getJSONObject(i)
+            if (a.getString("name").endsWith(".apk")) url = a.getString("browser_download_url")
+        }
+        if (url != null && isNewer(tag, currentVersion(ctx))) Upd.Available(tag, url) else Upd.Latest
+    } catch (e: Exception) { Upd.Failed }
+}
+
+suspend fun downloadApk(ctx: Context, url: String, onPct: (Int) -> Unit): File = withContext(Dispatchers.IO) {
+    val dir = File(ctx.cacheDir, "updates").apply { mkdirs() }
+    val out = File(dir, "Cosmos.apk")
+    val c = URL(url).openConnection() as HttpURLConnection
+    c.connectTimeout = 15000; c.readTimeout = 30000
+    val total = c.contentLengthLong
+    c.inputStream.use { inp ->
+        out.outputStream().use { o ->
+            val buf = ByteArray(32768); var read = 0L; var last = -1
+            while (true) {
+                val n = inp.read(buf); if (n < 0) break
+                o.write(buf, 0, n); read += n
+                if (total > 0) { val p = (read * 100 / total).toInt(); if (p != last) { last = p; onPct(p) } }
+            }
+        }
+    }
+    out
+}
+
+fun installApk(ctx: Context, f: File) {
+    if (!ctx.packageManager.canRequestPackageInstalls()) {
+        ctx.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${ctx.packageName}"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        return
+    }
+    val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.provider", f)
+    ctx.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+}
+
+@Composable
+fun UpdatePill(upd: Upd, ver: String, haptic: HapticFeedback, onClick: () -> Unit, modifier: Modifier) {
+    val label = when (upd) {
+        Upd.Idle -> "v$ver · CHECK UPDATE"
+        Upd.Checking -> "CHECKING…"
+        Upd.Latest -> "v$ver · UP TO DATE"
+        Upd.Failed -> "OFFLINE · RETRY"
+        is Upd.Available -> "UPDATE TO v${upd.ver}"
+        is Upd.Downloading -> "DOWNLOADING ${upd.pct}%"
+        is Upd.Ready -> "TAP TO INSTALL"
+    }
+    val hot = upd is Upd.Available || upd is Upd.Ready
+    val bg by animateColorAsState(if (hot) Lime else Color.Transparent, tween(400), label = "pillbg")
+    Row(
+        modifier.tap(haptic, true, onClick).clip(CircleShape).background(bg)
+            .border(1.dp, if (hot) Lime else Color.White.copy(0.5f), CircleShape)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(6.dp).clip(CircleShape).background(if (hot) Ink else Lime))
+        Spacer(Modifier.width(6.dp))
+        Text(label, color = if (hot) Ink else Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
     }
 }

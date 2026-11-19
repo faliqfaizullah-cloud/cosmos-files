@@ -9,9 +9,16 @@ android {
         applicationId = "com.cosmos.files"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        versionName = System.getenv("APP_VERSION") ?: "1.0"
     }
+    signingConfigs {
+        create("cosmos") {
+            storeFile = rootProject.file("cosmos.jks")
+            storePassword = "cosmos123"; keyAlias = "cosmos"; keyPassword = "cosmos123"
+        }
+    }
+    buildTypes { getByName("debug") { signingConfig = signingConfigs.getByName("cosmos") } }
     buildFeatures { compose = true }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     compileOptions {
