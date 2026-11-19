@@ -1,6 +1,22 @@
+@file:OptIn(ExperimentalFoundationApi::class)
+
 package com.cosmos.files
 
+import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.graphics.BitmapFactory
+import android.media.MediaScannerConnection
+import android.media.ThumbnailUtils
+import android.view.WindowManager
+import android.widget.Toast
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import java.security.MessageDigest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -202,12 +218,60 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
         }
     }
     var screen by remember { mutableIntStateOf(0) }
+    var refresh by remember { mutableIntStateOf(0) }
+    var unlocked by remember { mutableStateOf(false) }
+    var sheetFile by remember { mutableStateOf<File?>(null) }
+    var inVault by remember { mutableStateOf(false) }
+    var confirm by remember { mutableStateOf<Pair<String, () -> Unit>?>(null) }
     val root = remember { Environment.getExternalStorageDirectory() }
     var dir by remember { mutableStateOf(root) }
-    val stats by produceState(Stats(), granted) {
+    val stats by produceState(Stats(), granted, refresh) {
         value = if (granted) withContext(Dispatchers.IO) { scan(root) } else Stats()
     }
+    val toast: (String) -> Unit = { Toast.makeText(ctx, it, Toast.LENGTH_SHORT).show() }
+    val archive: (File) -> Unit = { f ->
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { Vault.add(ctx, f) }
+            toast(if (ok) "Moved to Archive" else "Couldn't archive"); refresh++
+        }
+    }
+    val deleteIt: (File) -> Unit = { f ->
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { f.deleteRecursively().also { Vault.scan(ctx, f.path) } }
+            toast(if (ok) "Deleted" else "Couldn't delete"); refresh++
+        }
+    }
+    val restore: (File) -> Unit = { f ->
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { Vault.restore(ctx, f) }
+            toast(if (ok) "Restored" else "Couldn't restore"); refresh++
+        }
+    }
+    val deleteForever: (File) -> Unit = { f ->
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { Vault.delete(ctx, f) }
+            toast(if (ok) "Deleted" else "Couldn't delete"); refresh++
+        }
+    }
+
     BackHandler(screen == 1) { if (dir != root) dir = dir.parentFile ?: root else screen = 0 }
+    BackHandler(screen == 2) { screen = if (granted) 1 else 0 }
+    BackHandler(sheetFile != null) { sheetFile = null }
+    BackHandler(confirm != null) { confirm = null }
+
+    // Archive screen: block screenshots / recents preview, and re-lock when leaving or backgrounded
+    DisposableEffect(screen) {
+        val w = (ctx as Activity).window
+        if (screen == 2) w.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        else { w.clearFlags(WindowManager.LayoutParams.FLAG_SECURE); unlocked = false }
+        onDispose { }
+    }
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_STOP) unlocked = false }
+        owner.lifecycle.addObserver(obs)
+        onDispose { owner.lifecycle.removeObserver(obs) }
+    }
 
     Box(Modifier.fillMaxSize().background(Ink)) {
         AnimatedContent(
@@ -220,15 +284,40 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
                     togetherWith (slideOutVertically(tween(650)) { it } + fadeOut(tween(400))))
             }, label = "nav"
         ) { s ->
-            if (s == 0) Home(stats, granted, haptic, upd, ver, onUpdate) { if (granted) screen = 1 else onAsk() }
-            else Explorer(stats, root, dir, haptic, { dir = it }, { dir = dir.parentFile?.takeIf { p -> dir != root } ?: root }, { screen = 0 })
+            when (s) {
+                0 -> Home(stats, granted, haptic, upd, ver, onUpdate, { screen = 2 }) { if (granted) screen = 1 else onAsk() }
+                1 -> Explorer(stats, root, dir, haptic, refresh, { dir = it },
+                    { dir = dir.parentFile?.takeIf { p -> dir != root } ?: root }, { screen = 0 },
+                    { sheetFile = it; inVault = false }, { screen = 2 })
+                else -> VaultScreen(unlocked, { unlocked = true }, refresh, haptic,
+                    { screen = if (granted) 1 else 0 }, { sheetFile = it; inVault = true })
+            }
         }
+
+        sheetFile?.let { f ->
+            val name = if (inVault) Vault.shownName(f) else f.name
+            val acts = if (!inVault) listOf(
+                Act(if (f.isDirectory) "Open folder" else "Open") { if (f.isDirectory) dir = f else openFile(ctx, f) },
+                Act("Move to Archive") { archive(f) },
+                Act("Delete", true) {
+                    confirm = ("Delete \"${f.name}\"" + (if (f.isDirectory) " and everything inside it" else "") + "? This can't be undone.") to { deleteIt(f) }
+                }
+            ) else listOf(
+                Act("Open") { openFile(ctx, f) },
+                Act("Restore to original place") { restore(f) },
+                Act("Delete forever", true) {
+                    confirm = ("Delete \"$name\" forever? This can't be undone.") to { deleteForever(f) }
+                }
+            )
+            ActionSheet(name, acts, haptic) { sheetFile = null }
+        }
+        confirm?.let { c -> ConfirmDialog(c.first, haptic, { confirm = null }) { val run = c.second; confirm = null; run() } }
     }
 }
 
 // ---------- Screen 1: Home ----------
 @Composable
-fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, upd: Upd, ver: String, onUpdate: () -> Unit, onOpen: () -> Unit) {
+fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, upd: Upd, ver: String, onUpdate: () -> Unit, onVault: () -> Unit, onOpen: () -> Unit) {
     val files by animateIntAsState(stats.files, tween(1400), label = "f")
     val folders by animateIntAsState(stats.folders, tween(1400), label = "d")
     val bob by rememberInfiniteTransition(label = "chev").animateFloat(0f, -6f,
@@ -296,7 +385,7 @@ fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, upd: Upd, ver: 
                 drawPath(seg.asComposePath(), Color.White, style = Stroke(2.dp.toPx(), cap = StrokeCap.Round))
             }
             Box(Modifier.align(Alignment.BottomStart).padding(bottom = 22.dp)) { Stamp("DIGITAL · FILES · COSMOS · ", Lime, Ink, 112.dp, haptic) }
-            Box(Modifier.align(Alignment.BottomEnd).padding(bottom = 22.dp)) { Stamp("COSMOS · STORAGE · VAULT · ", Violet, Ink, 112.dp, haptic, true) }
+            Box(Modifier.align(Alignment.BottomEnd).padding(bottom = 22.dp)) { Stamp("COSMOS · STORAGE · VAULT · ", Violet, Ink, 112.dp, haptic, true, onVault) }
             Box(
                 Modifier.align(Alignment.BottomCenter).offset(y = bob.dp).width(58.dp).height(24.dp)
                     .clip(RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp)).background(Color.White).tap(haptic, true, onOpen),
@@ -308,13 +397,13 @@ fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, upd: Upd, ver: 
 
 // ---------- Rotating text stamp with globe ----------
 @Composable
-fun Stamp(text: String, fill: Color, ink: Color, size: androidx.compose.ui.unit.Dp, haptic: HapticFeedback, reverse: Boolean = false) {
+fun Stamp(text: String, fill: Color, ink: Color, size: androidx.compose.ui.unit.Dp, haptic: HapticFeedback, reverse: Boolean = false, onClick: () -> Unit = {}) {
     var boost by remember { mutableFloatStateOf(0f) }
     val spin by animateFloatAsState(boost, tween(900, easing = FastOutSlowInEasing), label = "boost")
     val rot by rememberInfiniteTransition(label = "stamp").animateFloat(0f, if (reverse) -360f else 360f,
         infiniteRepeatable(tween(14000, easing = LinearEasing)), label = "rot")
     val paint = remember { android.graphics.Paint().apply { isAntiAlias = true; typeface = android.graphics.Typeface.DEFAULT_BOLD } }
-    Canvas(Modifier.size(size).tap(haptic, true) { boost += 360f }) {
+    Canvas(Modifier.size(size).tap(haptic, true) { boost += 360f; onClick() }) {
         val r = this.size.width / 2
         drawCircle(fill)
         paint.color = ink.toArgb(); paint.textSize = r * 0.2f
@@ -360,11 +449,12 @@ fun CosmicHero() {
 // ---------- Screen 2: Explorer ----------
 @Composable
 fun Explorer(
-    stats: Stats, root: File, dir: File, haptic: HapticFeedback,
-    onDir: (File) -> Unit, onUp: () -> Unit, onHome: () -> Unit
+    stats: Stats, root: File, dir: File, haptic: HapticFeedback, refresh: Int,
+    onDir: (File) -> Unit, onUp: () -> Unit, onHome: () -> Unit,
+    onLong: (File) -> Unit, onVault: () -> Unit
 ) {
     val ctx = LocalContext.current
-    val entries = remember(dir) {
+    val entries = remember(dir, refresh) {
         (dir.listFiles()?.toList() ?: emptyList()).sortedWith(compareBy<File>({ !it.isDirectory }, { it.name.lowercase() }))
     }
     val free = remember(dir) { runCatching { StatFs(root.path).availableBytes }.getOrDefault(0L) }
@@ -382,7 +472,7 @@ fun Explorer(
                 }
             }
             Text("←", color = Color.White, fontSize = 22.sp, modifier = Modifier.align(Alignment.TopStart).tap(haptic, true, onHome).padding(4.dp))
-            Box(Modifier.align(Alignment.BottomStart)) { Stamp("COSMOS · FILES · ", Violet, Ink, 84.dp, haptic) }
+            Box(Modifier.align(Alignment.BottomStart)) { Stamp("COSMOS · FILES · ", Violet, Ink, 84.dp, haptic, false, onVault) }
         }
         Box(Modifier.fillMaxWidth().weight(0.64f)) {
             LazyColumn(
@@ -406,13 +496,25 @@ fun Explorer(
                         Stat("Items", "${entries.size}", Modifier.weight(1f).padding(start = 12.dp))
                     }
                     Spacer(Modifier.height(14.dp))
-                    Row(
-                        Modifier.fillMaxWidth().height(46.dp).tap(haptic, true, onUp).border(1.5.dp, Ink, CircleShape).padding(horizontal = 20.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Go up", fontWeight = FontWeight.SemiBold, color = Ink)
-                        Text(dir.path.removePrefix(root.path).ifEmpty { "/" }, color = Grey, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(start = 16.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            Modifier.weight(1f).height(46.dp).tap(haptic, true, onUp).border(1.5.dp, Ink, CircleShape).padding(horizontal = 18.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Go up", fontWeight = FontWeight.SemiBold, color = Ink)
+                            Text(dir.path.removePrefix(root.path).ifEmpty { "/" }, color = Grey, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(start = 12.dp))
+                        }
+                        Row(
+                            Modifier.height(46.dp).tap(haptic, true, onVault).clip(CircleShape).background(Ink).padding(horizontal = 18.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(Modifier.size(8.dp).clip(CircleShape).background(Lime))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Archive", color = Color.White, fontWeight = FontWeight.SemiBold)
+                        }
                     }
+                    Spacer(Modifier.height(6.dp))
+                    Text("Hold any file or folder to archive or delete", color = Grey, fontSize = 11.sp)
                     Spacer(Modifier.height(18.dp))
                     Text("Next folders", fontSize = 12.sp, color = Ink)
                     Spacer(Modifier.height(8.dp))
@@ -427,11 +529,9 @@ fun Explorer(
                     Spacer(Modifier.height(12.dp))
                 }
                 items(entries, key = { it.path }) { f ->
-                    Row(Modifier.fillMaxWidth().tap(haptic) { if (f.isDirectory) onDir(f) else openFile(ctx, f) }.padding(vertical = 8.dp),
+                    Row(Modifier.fillMaxWidth().tapLong(haptic, { onLong(f) }) { if (f.isDirectory) onDir(f) else openFile(ctx, f) }.padding(vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(42.dp).clip(RoundedCornerShape(14.dp)).background(Ink), contentAlignment = Alignment.Center) {
-                            Text(if (f.isDirectory) "▸" else f.extension.take(3).uppercase().ifEmpty { "•" }, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                        }
+                        Thumb(f, 42.dp)
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(f.name, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -576,5 +676,265 @@ fun UpdatePill(upd: Upd, ver: String, haptic: HapticFeedback, onClick: () -> Uni
         Box(Modifier.size(6.dp).clip(CircleShape).background(if (hot) Ink else Lime))
         Spacer(Modifier.width(6.dp))
         Text(label, color = if (hot) Ink else Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+
+// ---------- Long-press + haptic ----------
+fun Modifier.tapLong(haptic: HapticFeedback, onLong: () -> Unit, onClick: () -> Unit) = composed {
+    val src = remember { MutableInteractionSource() }
+    val pressed by src.collectIsPressedAsState()
+    val sc by animateFloatAsState(
+        if (pressed) 0.96f else 1f,
+        spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessMedium), label = "pressL"
+    )
+    this.scale(sc).combinedClickable(
+        interactionSource = src, indication = null,
+        onLongClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onLong() },
+        onClick = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); onClick() }
+    )
+}
+
+// ---------- Private archive (app-private storage + PIN) ----------
+object Vault {
+    fun dir(ctx: Context) = File(ctx.filesDir, "archive").apply { mkdirs() }
+    private fun p(ctx: Context) = ctx.getSharedPreferences("vault", Context.MODE_PRIVATE)
+    private fun idx(ctx: Context) = JSONObject(p(ctx).getString("idx", "{}") ?: "{}")
+    private fun hash(pin: String) =
+        MessageDigest.getInstance("SHA-256").digest("cosmos:$pin".toByteArray()).joinToString("") { "%02x".format(it) }
+
+    fun hasPin(ctx: Context) = p(ctx).contains("pin")
+    fun setPin(ctx: Context, pin: String) { p(ctx).edit().putString("pin", hash(pin)).apply() }
+    fun checkPin(ctx: Context, pin: String) = p(ctx).getString("pin", null) == hash(pin)
+    fun shownName(f: File) = f.name.substringAfter("_", f.name)
+    fun list(ctx: Context) = (dir(ctx).listFiles()?.toList() ?: emptyList()).sortedByDescending { it.lastModified() }
+    fun original(ctx: Context, f: File) = idx(ctx).optString(f.name, "")
+    fun scan(ctx: Context, path: String) { runCatching { MediaScannerConnection.scanFile(ctx, arrayOf(path), null, null) } }
+
+    private fun copy(src: File, dst: File): Boolean =
+        if (src.isDirectory) src.copyRecursively(dst, true) else { src.copyTo(dst, true); true }
+
+    private fun record(ctx: Context, name: String, orig: String?) {
+        val j = idx(ctx)
+        if (orig == null) j.remove(name) else j.put(name, orig)
+        p(ctx).edit().putString("idx", j.toString()).apply()
+    }
+
+    fun add(ctx: Context, f: File): Boolean = try {
+        val dst = File(dir(ctx), "${System.currentTimeMillis()}_${f.name}")
+        if (!copy(f, dst)) false
+        else if (!f.deleteRecursively()) { dst.deleteRecursively(); false }
+        else { record(ctx, dst.name, f.path); scan(ctx, f.path); true }
+    } catch (e: Exception) { false }
+
+    fun restore(ctx: Context, f: File): Boolean = try {
+        val o = original(ctx, f)
+        val orig = File(if (o.isEmpty()) File(Environment.getExternalStorageDirectory(), "Restored/" + shownName(f)).path else o)
+        orig.parentFile?.mkdirs()
+        val dst = if (orig.exists())
+            File(orig.parentFile, orig.nameWithoutExtension + "_restored" + (if (orig.extension.isEmpty()) "" else "." + orig.extension))
+        else orig
+        if (!copy(f, dst)) false else { f.deleteRecursively(); record(ctx, f.name, null); scan(ctx, dst.path); true }
+    } catch (e: Exception) { false }
+
+    fun delete(ctx: Context, f: File): Boolean = try {
+        val ok = f.deleteRecursively(); if (ok) record(ctx, f.name, null); ok
+    } catch (e: Exception) { false }
+}
+
+// ---------- Thumbnail (photo / video preview, else extension tile) ----------
+@Composable
+fun Thumb(f: File, size: androidx.compose.ui.unit.Dp) {
+    val cat = if (f.isDirectory) "Folder" else category(f.extension)
+    val bmp by produceState<ImageBitmap?>(null, f.path) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                when (cat) {
+                    "Images" -> {
+                        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeFile(f.path, o)
+                        var sm = 1; while (o.outWidth / sm > 256) sm *= 2
+                        BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = sm })?.asImageBitmap()
+                    }
+                    "Videos" -> if (Build.VERSION.SDK_INT >= 29)
+                        ThumbnailUtils.createVideoThumbnail(f, android.util.Size(256, 256), null).asImageBitmap() else null
+                    else -> null
+                }
+            }.getOrNull()
+        }
+    }
+    Box(Modifier.size(size).clip(RoundedCornerShape(14.dp)).background(Ink), contentAlignment = Alignment.Center) {
+        val b = bmp
+        if (b != null) {
+            Image(b, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            if (cat == "Videos") Text("▶", color = Color.White, fontSize = 14.sp)
+        } else Text(if (f.isDirectory) "▸" else f.extension.take(3).uppercase().ifEmpty { "•" },
+            color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+    }
+}
+
+// ---------- PIN screen ----------
+@Composable
+fun PinScreen(haptic: HapticFeedback, onBack: () -> Unit, onDone: () -> Unit) {
+    val ctx = LocalContext.current
+    val has = remember { Vault.hasPin(ctx) }
+    var pin by remember { mutableStateOf("") }
+    var first by remember { mutableStateOf<String?>(null) }
+    var msg by remember { mutableStateOf(if (has) "Enter your PIN" else "Create a 4-digit PIN") }
+    val press: (String) -> Unit = { d ->
+        if (pin.length < 4) {
+            pin += d
+            if (pin.length == 4) {
+                if (has) {
+                    if (Vault.checkPin(ctx, pin)) onDone()
+                    else { msg = "Wrong PIN, try again"; pin = ""; haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
+                } else if (first == null) { first = pin; pin = ""; msg = "Confirm your PIN" }
+                else if (first == pin) { Vault.setPin(ctx, pin); onDone() }
+                else { msg = "PINs didn't match. Start again"; first = null; pin = "" }
+            }
+        }
+    }
+    Column(
+        Modifier.fillMaxSize().background(Ink).windowInsetsPadding(WindowInsets.safeDrawing).padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center
+    ) {
+        Stamp("COSMOS · ARCHIVE · PRIVATE · ", Lime, Ink, 76.dp, haptic)
+        Spacer(Modifier.height(16.dp))
+        Text("Cosmos.//Archive", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        Text(msg, color = Grey, fontSize = 14.sp)
+        Spacer(Modifier.height(20.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            for (i in 0 until 4) {
+                val on = i < pin.length
+                val sc by animateFloatAsState(if (on) 1.25f else 1f, spring(Spring.DampingRatioHighBouncy), label = "dot")
+                Box(Modifier.scale(sc).size(16.dp).clip(CircleShape)
+                    .background(if (on) Lime else Color.Transparent).border(1.5.dp, if (on) Lime else Color.White.copy(0.4f), CircleShape))
+            }
+        }
+        Spacer(Modifier.height(28.dp))
+        listOf(listOf("1", "2", "3"), listOf("4", "5", "6"), listOf("7", "8", "9"), listOf("✕", "0", "⌫")).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(22.dp), modifier = Modifier.padding(vertical = 8.dp)) {
+                row.forEach { k ->
+                    Box(Modifier.size(70.dp).tap(haptic) {
+                        when (k) { "✕" -> onBack(); "⌫" -> pin = pin.dropLast(1); else -> press(k) }
+                    }.clip(CircleShape).background(Color(0xFF1B1B20)), contentAlignment = Alignment.Center) {
+                        Text(k, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Medium)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- Screen 3: Archive ----------
+@Composable
+fun VaultScreen(unlocked: Boolean, onUnlock: () -> Unit, refresh: Int, haptic: HapticFeedback, onBack: () -> Unit, onLong: (File) -> Unit) {
+    if (!unlocked) { PinScreen(haptic, onBack, onUnlock) } else {
+        val ctx = LocalContext.current
+        val stash = remember(refresh) { Vault.list(ctx) }
+        val total = remember(refresh) {
+            stash.sumOf { if (it.isDirectory) it.walkTopDown().filter { x -> x.isFile }.sumOf { x -> x.length() } else it.length() }
+        }
+        Column(Modifier.fillMaxSize().background(Ink).windowInsetsPadding(WindowInsets.safeDrawing)) {
+            Box(Modifier.fillMaxWidth().weight(0.26f).padding(22.dp)) {
+                Text("←", color = Color.White, fontSize = 22.sp, modifier = Modifier.align(Alignment.TopStart).tap(haptic, true, onBack).padding(4.dp))
+                Box(Modifier.align(Alignment.TopEnd)) { Stamp("PRIVATE · LOCKED · ", Lime, Ink, 72.dp, haptic) }
+                Column(Modifier.align(Alignment.BottomStart)) {
+                    Text("Cosmos", color = Color.White, fontSize = 42.sp, fontWeight = FontWeight.Bold, letterSpacing = (-1.5).sp, lineHeight = 40.sp)
+                    Text(buildAnnotatedString {
+                        append("//"); withStyle(SpanStyle(fontStyle = FontStyle.Italic, fontWeight = FontWeight.Light)) { append("archive") }
+                    }, color = Color.White, fontSize = 42.sp, fontWeight = FontWeight.Bold, letterSpacing = (-1.5).sp, lineHeight = 40.sp)
+                }
+                Text("${stash.size} items · ${fmt(total)}", color = Grey, fontSize = 12.sp, modifier = Modifier.align(Alignment.BottomEnd))
+            }
+            LazyColumn(
+                Modifier.weight(0.74f).fillMaxWidth().clip(RoundedCornerShape(topStart = 34.dp, topEnd = 34.dp)).background(Color.White),
+                contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 22.dp, bottom = 30.dp)
+            ) {
+                if (stash.isEmpty()) item {
+                    Text("Nothing here yet.\nHold any photo, video or file in Explorer and choose Move to Archive.\n\nArchived files are hidden from the Gallery and other apps. They live inside Cosmos, so uninstalling the app erases them.",
+                        color = Grey, fontSize = 14.sp, lineHeight = 20.sp)
+                }
+                items(stash, key = { it.path }) { f ->
+                    val from = Vault.original(ctx, f).let { o -> if (o.isEmpty()) "" else File(o).parentFile?.name ?: "" }
+                    Row(Modifier.fillMaxWidth().tapLong(haptic, { onLong(f) }) { openFile(ctx, f) }.padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Thumb(f, 52.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(Vault.shownName(f), color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text((if (f.isDirectory) "Folder" else fmt(f.length())) + (if (from.isEmpty()) "" else " · from $from"), color = Grey, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- Action sheet + confirm ----------
+data class Act(val label: String, val danger: Boolean = false, val run: () -> Unit)
+
+@Composable
+fun ActionSheet(title: String, acts: List<Act>, haptic: HapticFeedback, onDismiss: () -> Unit) {
+    var show by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { show = true }
+    val none = remember { MutableInteractionSource() }
+    Box(Modifier.fillMaxSize().background(Color.Black.copy(0.55f))
+        .clickable(interactionSource = none, indication = null) { onDismiss() }) {
+        AnimatedVisibility(
+            show, Modifier.align(Alignment.BottomCenter),
+            enter = slideInVertically(spring(Spring.DampingRatioLowBouncy)) { it } + fadeIn()
+        ) {
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(topStart = 34.dp, topEnd = 34.dp)).background(Color.White)
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
+                    .windowInsetsPadding(WindowInsets.safeDrawing).padding(22.dp)
+            ) {
+                Text(title, color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.height(12.dp))
+                acts.forEach { a ->
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 5.dp).height(52.dp)
+                            .tap(haptic, a.danger) { onDismiss(); a.run() }
+                            .clip(CircleShape).background(if (a.danger) Color(0xFFFF4D4D) else Ink),
+                        horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically
+                    ) { Text(a.label, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 16.sp) }
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 5.dp).height(52.dp).tap(haptic) { onDismiss() }
+                        .border(1.5.dp, Ink, CircleShape),
+                    horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically
+                ) { Text("Cancel", color = Ink, fontWeight = FontWeight.SemiBold, fontSize = 16.sp) }
+            }
+        }
+    }
+}
+
+@Composable
+fun ConfirmDialog(text: String, haptic: HapticFeedback, onCancel: () -> Unit, onOk: () -> Unit) {
+    Box(Modifier.fillMaxSize().background(Color.Black.copy(0.65f))
+        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onCancel() },
+        contentAlignment = Alignment.Center) {
+        Column(
+            Modifier.padding(28.dp).clip(RoundedCornerShape(32.dp)).background(Color.White)
+                .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}.padding(24.dp)
+        ) {
+            Text("Are you sure?", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            Text(text, color = Grey, fontSize = 14.sp, lineHeight = 20.sp)
+            Spacer(Modifier.height(18.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(Modifier.weight(1f).height(48.dp).tap(haptic) { onCancel() }.border(1.5.dp, Ink, CircleShape),
+                    horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                    Text("Cancel", color = Ink, fontWeight = FontWeight.SemiBold)
+                }
+                Row(Modifier.weight(1f).height(48.dp).tap(haptic, true) { onOk() }.clip(CircleShape).background(Color(0xFFFF4D4D)),
+                    horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                    Text("Delete", color = Color.White, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
     }
 }
