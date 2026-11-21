@@ -3,6 +3,19 @@
 package com.cosmos.files
 
 import android.app.Activity
+import android.app.ActivityManager
+import android.app.NotificationManager
+import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
+import android.os.BatteryManager
+import android.os.PowerManager
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.core.graphics.drawable.toBitmap
+import java.net.InetSocketAddress
+import java.net.Socket
 import android.content.ActivityNotFoundException
 import android.graphics.BitmapFactory
 import android.media.MediaScannerConnection
@@ -256,6 +269,7 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
 
     BackHandler(screen == 1) { if (dir != root) dir = dir.parentFile ?: root else screen = 0 }
     BackHandler(screen == 2) { screen = if (granted) 1 else 0 }
+    BackHandler(screen == 3) { screen = 0 }
     BackHandler(sheetFile != null) { sheetFile = null }
     BackHandler(confirm != null) { confirm = null }
 
@@ -268,7 +282,10 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
     }
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner) {
-        val obs = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_STOP) unlocked = false }
+        val obs = LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_STOP) unlocked = false
+            else if (e == Lifecycle.Event.ON_START) Booster.endSession(ctx)
+        }
         owner.lifecycle.addObserver(obs)
         onDispose { owner.lifecycle.removeObserver(obs) }
     }
@@ -285,10 +302,11 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
             }, label = "nav"
         ) { s ->
             when (s) {
-                0 -> Home(stats, granted, haptic, upd, ver, onUpdate, { screen = 2 }) { if (granted) screen = 1 else onAsk() }
+                0 -> Home(stats, granted, haptic, upd, ver, onUpdate, { screen = 2 }, { screen = 3 }) { if (granted) screen = 1 else onAsk() }
                 1 -> Explorer(stats, root, dir, haptic, refresh, { dir = it },
                     { dir = dir.parentFile?.takeIf { p -> dir != root } ?: root }, { screen = 0 },
                     { sheetFile = it; inVault = false }, { screen = 2 })
+                3 -> BoostScreen(haptic) { screen = 0 }
                 else -> VaultScreen(unlocked, { unlocked = true }, refresh, haptic,
                     { screen = if (granted) 1 else 0 }, { sheetFile = it; inVault = true })
             }
@@ -317,7 +335,7 @@ fun CosmosApp(granted: Boolean, onAsk: () -> Unit) {
 
 // ---------- Screen 1: Home ----------
 @Composable
-fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, upd: Upd, ver: String, onUpdate: () -> Unit, onVault: () -> Unit, onOpen: () -> Unit) {
+fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, upd: Upd, ver: String, onUpdate: () -> Unit, onVault: () -> Unit, onBoost: () -> Unit, onOpen: () -> Unit) {
     val files by animateIntAsState(stats.files, tween(1400), label = "f")
     val folders by animateIntAsState(stats.folders, tween(1400), label = "d")
     val bob by rememberInfiniteTransition(label = "chev").animateFloat(0f, -6f,
@@ -384,7 +402,7 @@ fun Home(stats: Stats, granted: Boolean, haptic: HapticFeedback, upd: Upd, ver: 
                 pm.getSegment(0f, pm.length * prog.value, seg, true)
                 drawPath(seg.asComposePath(), Color.White, style = Stroke(2.dp.toPx(), cap = StrokeCap.Round))
             }
-            Box(Modifier.align(Alignment.BottomStart).padding(bottom = 22.dp)) { Stamp("DIGITAL · FILES · COSMOS · ", Lime, Ink, 112.dp, haptic) }
+            Box(Modifier.align(Alignment.BottomStart).padding(bottom = 22.dp)) { Stamp("GAME · BOOST · COSMOS · ", Lime, Ink, 112.dp, haptic, false, onBoost) }
             Box(Modifier.align(Alignment.BottomEnd).padding(bottom = 22.dp)) { Stamp("COSMOS · STORAGE · VAULT · ", Violet, Ink, 112.dp, haptic, true, onVault) }
             Box(
                 Modifier.align(Alignment.BottomCenter).offset(y = bob.dp).width(58.dp).height(24.dp)
@@ -933,6 +951,306 @@ fun ConfirmDialog(text: String, haptic: HapticFeedback, onCancel: () -> Unit, on
                 Row(Modifier.weight(1f).height(48.dp).tap(haptic, true) { onOk() }.clip(CircleShape).background(Color(0xFFFF4D4D)),
                     horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
                     Text("Delete", color = Color.White, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+
+// ---------- Game booster engine ----------
+data class AppItem(val pkg: String, val label: String, val auto: Boolean)
+data class Snap(val avail: Long = 0, val total: Long = 1, val temp: Float = 0f, val level: Int = 0, val thermal: String = "-")
+
+object Booster {
+    fun prefs(ctx: Context) = ctx.getSharedPreferences("boost", Context.MODE_PRIVATE)
+    private fun set(ctx: Context, key: String) = HashSet(prefs(ctx).getStringSet(key, emptySet()) ?: emptySet())
+
+    @Suppress("DEPRECATION")
+    private fun isGame(ai: ApplicationInfo) =
+        (Build.VERSION.SDK_INT >= 26 && ai.category == ApplicationInfo.CATEGORY_GAME) || (ai.flags and ApplicationInfo.FLAG_IS_GAME) != 0
+
+    fun launchables(ctx: Context): List<AppItem> {
+        val pm = ctx.packageManager
+        val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return pm.queryIntentActivities(i, 0)
+            .map { AppItem(it.activityInfo.packageName, it.loadLabel(pm).toString(), isGame(it.activityInfo.applicationInfo)) }
+            .filter { it.pkg != ctx.packageName }.distinctBy { it.pkg }.sortedBy { it.label.lowercase() }
+    }
+
+    fun games(ctx: Context, all: List<AppItem>): List<AppItem> {
+        val pinned = set(ctx, "pinned"); val hidden = set(ctx, "hidden")
+        return all.filter { (it.auto || it.pkg in pinned) && it.pkg !in hidden }
+    }
+
+    fun pin(ctx: Context, pkg: String) {
+        val pn = set(ctx, "pinned").apply { add(pkg) }; val hd = set(ctx, "hidden").apply { remove(pkg) }
+        prefs(ctx).edit().putStringSet("pinned", pn).putStringSet("hidden", hd).apply()
+    }
+
+    fun hide(ctx: Context, pkg: String) {
+        val pn = set(ctx, "pinned").apply { remove(pkg) }; val hd = set(ctx, "hidden").apply { add(pkg) }
+        prefs(ctx).edit().putStringSet("pinned", pn).putStringSet("hidden", hd).apply()
+    }
+
+    fun snapshot(ctx: Context): Snap {
+        val mi = ActivityManager.MemoryInfo()
+        ctx.getSystemService(ActivityManager::class.java).getMemoryInfo(mi)
+        val b = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val temp = (b?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10f
+        val lvl = b?.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) ?: 0
+        val th = if (Build.VERSION.SDK_INT >= 29) when (ctx.getSystemService(PowerManager::class.java).currentThermalStatus) {
+            0 -> "Cool"; 1 -> "Light"; 2 -> "Warm"; 3 -> "Hot"; else -> "Critical"
+        } else "-"
+        return Snap(mi.availMem, mi.totalMem.coerceAtLeast(1), temp, lvl, th)
+    }
+
+    suspend fun ping(): Int? = withContext(Dispatchers.IO) {
+        runCatching {
+            val t = System.nanoTime()
+            Socket().use { it.connect(InetSocketAddress("1.1.1.1", 443), 2000) }
+            ((System.nanoTime() - t) / 1_000_000).toInt()
+        }.getOrNull()
+    }
+
+    /** Ends cached background processes of other apps (the strongest thing a non-root app may do). */
+    fun clean(ctx: Context, except: String?) {
+        val am = ctx.getSystemService(ActivityManager::class.java)
+        launchables(ctx).filter { it.pkg != except }.forEach { runCatching { am.killBackgroundProcesses(it.pkg) } }
+    }
+
+    fun hasDnd(ctx: Context) = ctx.getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted
+
+    fun startSession(ctx: Context) {
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        if (!nm.isNotificationPolicyAccessGranted) return
+        prefs(ctx).edit().putInt("prev", nm.currentInterruptionFilter).putBoolean("session", true).apply()
+        nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_PRIORITY)
+    }
+
+    fun endSession(ctx: Context) {
+        val pr = prefs(ctx)
+        if (!pr.getBoolean("session", false)) return
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        if (nm.isNotificationPolicyAccessGranted) {
+            val prev = pr.getInt("prev", NotificationManager.INTERRUPTION_FILTER_ALL).takeIf { it in 1..4 } ?: NotificationManager.INTERRUPTION_FILTER_ALL
+            nm.setInterruptionFilter(prev)
+        }
+        pr.edit().putBoolean("session", false).apply()
+    }
+
+    fun launch(ctx: Context, pkg: String) {
+        ctx.packageManager.getLaunchIntentForPackage(pkg)?.let { ctx.startActivity(it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+    }
+}
+
+@Composable
+fun AppIcon(pkg: String, size: androidx.compose.ui.unit.Dp) {
+    val ctx = LocalContext.current
+    val bmp by produceState<ImageBitmap?>(null, pkg) {
+        value = withContext(Dispatchers.IO) {
+            runCatching { ctx.packageManager.getApplicationIcon(pkg).toBitmap(160, 160).asImageBitmap() }.getOrNull()
+        }
+    }
+    Box(Modifier.size(size).clip(RoundedCornerShape(size * 0.28f)).background(Color(0xFFEDEDF0)), contentAlignment = Alignment.Center) {
+        bmp?.let { Image(it, null, Modifier.fillMaxSize()) }
+    }
+}
+
+@Composable
+fun TogglePill(label: String, on: Boolean, haptic: HapticFeedback, onClick: () -> Unit) {
+    val bg by animateColorAsState(if (on) Lime else Color.Transparent, tween(300), label = "tg")
+    Row(
+        Modifier.tap(haptic, true, onClick).clip(CircleShape).background(bg)
+            .border(1.dp, if (on) Lime else Color.White.copy(0.5f), CircleShape).padding(horizontal = 14.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(8.dp).clip(CircleShape).background(if (on) Ink else Color.White.copy(0.6f)))
+        Spacer(Modifier.width(8.dp))
+        Text(label, color = if (on) Ink else Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+// ---------- Screen 4: Game boost ----------
+@Composable
+fun BoostScreen(haptic: HapticFeedback, onBack: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var snap by remember { mutableStateOf(Snap()) }
+    var ping by remember { mutableStateOf<Int?>(null) }
+    var all by remember { mutableStateOf<List<AppItem>>(emptyList()) }
+    var games by remember { mutableStateOf<List<AppItem>>(emptyList()) }
+    var tick by remember { mutableIntStateOf(0) }
+    var clearRam by remember { mutableStateOf(Booster.prefs(ctx).getBoolean("clear", true)) }
+    var dnd by remember { mutableStateOf(Booster.prefs(ctx).getBoolean("dnd", true)) }
+    var dndOk by remember { mutableStateOf(Booster.hasDnd(ctx)) }
+    var busy by remember { mutableStateOf(false) }
+    var report by remember { mutableStateOf("") }
+    var picker by remember { mutableStateOf(false) }
+    var removeT by remember { mutableStateOf<AppItem?>(null) }
+
+    BackHandler(picker || removeT != null) { picker = false; removeT = null }
+
+    LaunchedEffect(tick) {
+        withContext(Dispatchers.IO) { val a = Booster.launchables(ctx); all = a; games = Booster.games(ctx, a) }
+    }
+    LaunchedEffect(Unit) {
+        var i = 0
+        while (true) {
+            snap = Booster.snapshot(ctx); dndOk = Booster.hasDnd(ctx)
+            if (i % 5 == 0) ping = Booster.ping()
+            i++; delay(2000)
+        }
+    }
+
+    fun boost(target: AppItem?) {
+        if (busy) return
+        scope.launch {
+            busy = true
+            val before = Booster.snapshot(ctx).avail
+            if (clearRam) withContext(Dispatchers.IO) { Booster.clean(ctx, target?.pkg) }
+            if (target != null && dnd && dndOk) Booster.startSession(ctx)
+            delay(1300)
+            val after = Booster.snapshot(ctx); snap = after
+            ping = Booster.ping()
+            val freed = (after.avail - before).coerceAtLeast(0)
+            report = (if (clearRam) (if (freed > 0) "Freed ${fmt(freed)}" else "Memory already optimal") else "RAM clean skipped") +
+                " · " + (ping?.let { "ping $it ms" } ?: "offline")
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            busy = false
+            if (target != null) Booster.launch(ctx, target.pkg)
+        }
+    }
+
+    val used = (1f - snap.avail.toFloat() / snap.total.toFloat()).coerceIn(0f, 1f)
+    val usedAnim by animateFloatAsState(used, tween(800), label = "used")
+    val spin by rememberInfiniteTransition(label = "spin").animateFloat(0f, 360f, infiniteRepeatable(tween(900, easing = LinearEasing)), label = "sp")
+
+    Box(Modifier.fillMaxSize().background(Ink).windowInsetsPadding(WindowInsets.safeDrawing)) {
+        Column(Modifier.fillMaxSize()) {
+            Box(Modifier.fillMaxWidth().height(160.dp).padding(22.dp)) {
+                Text("←", color = Color.White, fontSize = 22.sp, modifier = Modifier.align(Alignment.TopStart).tap(haptic, true, onBack).padding(4.dp))
+                Column(Modifier.align(Alignment.BottomStart)) {
+                    Text("Cosmos", color = Color.White, fontSize = 40.sp, fontWeight = FontWeight.Bold, letterSpacing = (-1.5).sp, lineHeight = 38.sp)
+                    Text(buildAnnotatedString {
+                        append("//"); withStyle(SpanStyle(fontStyle = FontStyle.Italic, fontWeight = FontWeight.Light)) { append("boost") }
+                    }, color = Color.White, fontSize = 40.sp, fontWeight = FontWeight.Bold, letterSpacing = (-1.5).sp, lineHeight = 38.sp)
+                }
+                Box(Modifier.align(Alignment.CenterEnd).size(108.dp), contentAlignment = Alignment.Center) {
+                    Canvas(Modifier.fillMaxSize()) {
+                        val sw = 10.dp.toPx(); val tl = Offset(sw / 2, sw / 2); val sz = Size(size.width - sw, size.height - sw)
+                        drawArc(Color(0xFF2A2A30), -90f, 360f, false, tl, sz, style = Stroke(sw, cap = StrokeCap.Round))
+                        drawArc(if (usedAnim > 0.85f) Color(0xFFFF4D4D) else Lime, -90f, 360f * usedAnim, false, tl, sz, style = Stroke(sw, cap = StrokeCap.Round))
+                        if (busy) drawArc(Color.White, spin, 50f, false, tl, sz, style = Stroke(sw / 2, cap = StrokeCap.Round))
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("${(usedAnim * 100).toInt()}%", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                        Text("RAM used", color = Grey, fontSize = 10.sp)
+                    }
+                }
+            }
+            Column(Modifier.padding(horizontal = 22.dp)) {
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0xFF3A3A40)))
+                Row(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Free RAM", color = Grey, fontSize = 12.sp)
+                        Text(fmt(snap.avail), color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Column(Modifier.weight(1f)) {
+                        Text("Temp · ${snap.thermal}", color = Grey, fontSize = 12.sp)
+                        Text("%.1f°C".format(snap.temp), color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Column(Modifier.weight(0.8f).tap(haptic) { scope.launch { ping = Booster.ping() } }) {
+                        Text("Ping", color = Grey, fontSize = 12.sp)
+                        Text(ping?.let { "$it ms" } ?: "-", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Color(0xFF3A3A40)))
+                Spacer(Modifier.height(12.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    TogglePill("Clear RAM", clearRam, haptic) { clearRam = !clearRam; Booster.prefs(ctx).edit().putBoolean("clear", clearRam).apply() }
+                    TogglePill(if (dndOk) "Silence alerts" else "Silence alerts · allow", dnd && dndOk, haptic) {
+                        if (!dndOk) ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        else { dnd = !dnd; Booster.prefs(ctx).edit().putBoolean("dnd", dnd).apply() }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(if (report.isEmpty()) "Tap a game to clean memory and launch it" else report,
+                    color = if (report.isEmpty()) Grey else Lime, fontSize = 12.sp, modifier = Modifier.padding(end = 120.dp).height(32.dp))
+            }
+            Box(Modifier.fillMaxWidth().weight(1f)) {
+                LazyVerticalGrid(
+                    GridCells.Fixed(4),
+                    Modifier.fillMaxSize().clip(RoundedCornerShape(topStart = 34.dp, topEnd = 34.dp)).background(Color.White),
+                    contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 24.dp, bottom = 30.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Column {
+                            Text("Your games", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                            Text("Tap to boost and play · hold to remove", color = Grey, fontSize = 11.sp)
+                        }
+                    }
+                    gridItems(games, key = { it.pkg }) { g ->
+                        Column(Modifier.tapLong(haptic, { removeT = g }) { boost(g) }, horizontalAlignment = Alignment.CenterHorizontally) {
+                            AppIcon(g.pkg, 62.dp)
+                            Spacer(Modifier.height(4.dp))
+                            Text(g.label, color = Ink, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+                        }
+                    }
+                    item {
+                        Column(Modifier.tap(haptic, true) { picker = true }, horizontalAlignment = Alignment.CenterHorizontally) {
+                            Box(Modifier.size(62.dp).clip(RoundedCornerShape(17.dp)).border(1.5.dp, Ink, RoundedCornerShape(17.dp)), contentAlignment = Alignment.Center) {
+                                Text("+", color = Ink, fontSize = 28.sp, fontWeight = FontWeight.Light)
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text("Add", color = Ink, fontSize = 11.sp)
+                        }
+                    }
+                }
+                Box(
+                    Modifier.align(Alignment.TopEnd).offset(y = (-23).dp).padding(end = 18.dp).size(104.dp, 46.dp)
+                        .tap(haptic, true) { boost(null) }.clip(RoundedCornerShape(23.dp)).background(Lime),
+                    contentAlignment = Alignment.Center
+                ) { Text("BOOST", color = Ink, fontWeight = FontWeight.Black, fontSize = 16.sp) }
+            }
+        }
+
+        if (picker) {
+            val none = remember { MutableInteractionSource() }
+            val listed = games.map { it.pkg }.toSet()
+            Box(Modifier.fillMaxSize().background(Color.Black.copy(0.6f)).clickable(interactionSource = none, indication = null) { picker = false }) {
+                Column(
+                    Modifier.align(Alignment.BottomCenter).fillMaxWidth().fillMaxHeight(0.68f)
+                        .clip(RoundedCornerShape(topStart = 34.dp, topEnd = 34.dp)).background(Color.White)
+                        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
+                        .padding(top = 22.dp, start = 22.dp, end = 22.dp)
+                ) {
+                    Text("Add to Boost", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(8.dp))
+                    LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+                        items(all.filter { it.pkg !in listed }, key = { it.pkg }) { a ->
+                            Row(Modifier.fillMaxWidth().tap(haptic) { Booster.pin(ctx, a.pkg); tick++; picker = false }.padding(vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically) {
+                                AppIcon(a.pkg, 42.dp)
+                                Spacer(Modifier.width(12.dp))
+                                Text(a.label, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        removeT?.let { t ->
+            ActionSheet(t.label, listOf(Act("Remove from list", true) { Booster.hide(ctx, t.pkg); tick++ }), haptic) { removeT = null }
+        }
+        if (busy) {
+            Box(Modifier.fillMaxSize().background(Color.Black.copy(0.78f)).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {},
+                contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Stamp("OPTIMIZING · COSMOS · BOOST · ", Lime, Ink, 150.dp, haptic)
+                    Spacer(Modifier.height(16.dp))
+                    Text("Optimizing…", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }
